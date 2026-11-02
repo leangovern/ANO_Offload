@@ -21,6 +21,7 @@
 #include <acl/acl.h>
 #include <aclnn/aclnn_base.h>
 #include "aclnn_ano_probe.h"
+#include "sqe96_build.h"	/* 任务 43：prep 包内 cmd/route/seg 类型单源（-I AnoProbeBuild/op_kernel） */
 #include <ub/umdk/urma/urma_api.h>
 
 /* ---- AnoProbe 进程内探针面（12-b n2_aiv_host.cpp 同款机器，进程内复刻；算子历史名 N2AivProbe） ---- */
@@ -510,157 +511,112 @@ run_side(int is_server, int acl_dev, int urma_idx, uint32_t phy_id_arg, uint32_t
 	}
 	printf("=== 守候销毁信号（%s）===\n", is_server ? "server" : "client");
 
-	/* ================= 任务 39：WRITE_WITH_NOTIFY 命令面（wnfire 子命令，client 侧） =================
-	/* 2-WQEBB 形态（任务 36 对拍在案）：slot0=WQE ctl48B+NotifyCtx 前 16B，slot1=NotifyCtx 后 16B+SGE。
-	 * 发射纪律：slot0 先写+无害门铃（magic=0，12-c stage0 在案），slot1 写完才落真门铃（head+2）；
-	 * flag=0x2D（URMA_DEFAULT_CFG 官方默认：relax 序+fence+cqe，inner_def.h:55-61 在案）。 */
+	/* ================= 任务 43：全链一体（wnfire 子命令，client 侧；ano_full 形态） =================
+	 * host 只做 prep（一次性 H2D：prep 包+fire_idx+d_params）；发射热路径 =
+	 * AIV kernel mode4 读表→组 SQE（sqe96_build 生产镜像）→组 WQE（36 对拍表）
+	 * →上环敲门→收割→回执消费+清位，host 每发仅 aclnn 启动+sync+D2H 观察。
+	 * G4 判据：热路径循环体内零 H2D（代码审查 + prep 边界打点）。 */
 	if (g_wnfire && !is_server) {
 		uint32_t ltid = lb.bufferInfo.rma.protectionInfo.memInfo.ub.tokenId;
 		uint32_t rtid = rb.bufferInfo.rma.protectionInfo.memInfo.ub.tokenId;
 		uint32_t rtval = rb.bufferInfo.rma.protectionInfo.memInfo.ub.tokenValue;
 		uint64_t rmt = rb.bufferInfo.rma.addr;
 		uint64_t lva = (uint64_t)(uintptr_t)dbuf;
-		uint64_t inbox = rmt + 0x800;	/* 对端命令收件箱槽环基址（tgt_wn 约定：8 槽×128B） */
-		uint64_t cqe_va = lva + 0x100;
-		uint64_t data_va = lva + 0x200;
-		uint64_t sqd = sq.contextInfo.ubJfs.sqDepth;
-		uint64_t cqd = cq.contextInfo.ubJfc.cqDepth;
-		printf("=== wnfire：WRITE_WITH_NOTIFY（sqVa=0x%llx dbVa=0x%llx inbox=0x%llx rtid=%u ltid=%u iters=%d） ===\n",
+		printf("=== wnfire：全链一体 mode4（sqVa=0x%llx dbVa=0x%llx inbox=0x%llx rtid=%u ltid=%u iters=%d） ===\n",
 		       (unsigned long long)sq.contextInfo.ubJfs.sqVa,
 		       (unsigned long long)sq.contextInfo.ubJfs.dbVa,
-		       (unsigned long long)inbox, rtid, ltid, g_wniters);
-		uint32_t head0 = 0;
+		       (unsigned long long)(rmt + 0x800), rtid, ltid, g_wniters);
+
+		/* ---- prep（一次性，允许 H2D） ---- */
+		struct ano_full_prep_host {
+			uint64_t sqVa, dbVa, headAddr, scqVa;
+			uint64_t sqDepth, cqDepth, head0;
+			uint64_t inbox;
+			uint32_t rtid, rtval, ltid, tpID;
+			uint8_t rmtEID[16];
+			uint64_t staging_va, cqe_va, data_va, fire_idx_va;
+			struct sqe96_cmd_in cmd;
+			struct sqe96_route_in route;
+			struct sqe96_seg seg;
+		} pp;
 		uint8_t u32buf[4] = {0};
-		if (hp_read_data(d_params, d_out, pstream, sq.contextInfo.ubJfs.headAddr, 4, u32buf) == 0)
-			head0 = *(uint32_t *)u32buf;
-		uint32_t ok = 0;
-		uint32_t rok = 0;	/* 任务 40：AIV 图内回执收割成功计数（判据=AIV 侧读数） */
-		for (int it = 0; it < g_wniters; it++) {
-			uint32_t cid = (uint32_t)it % 8u;
-			uint32_t head = head0 + (uint32_t)it * 2u;
-			/* 1) 104B 载荷（8B 控制头 valid+cid + 96B SQE；SQE 字段与任务 33 逐字节一致） */
-			uint8_t pay[104];
-			memset(pay, 0, sizeof(pay));
-			pay[0] = 1;
-			pay[1] = (uint8_t)cid;
-			uint32_t *dw = (uint32_t *)(pay + 8);
-			dw[0] = 0x02;
-			dw[1] = 1;
-			uint8_t *sgl = pay + 8 + 24;
-			*(uint64_t *)sgl = data_va;
-			sgl[8] = 0x00; sgl[9] = 0x01; sgl[10] = 0x00;
-			*(uint32_t *)(sgl + 11) = ltid;
-			sgl[15] = 0x04;
-			dw[10] = 8; dw[11] = 0;
-			dw[22] = 0x1001u | (1u << 16);
-			dw[23] = 0xACFEu;
-			if (aclrtMemcpy((char *)dbuf + 0x400, sizeof(pay), pay, sizeof(pay),
-					ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
-				printf("FAIL 载荷 H2D\n"); return 2;
-			}
-			/* 2) 128B WQE 镜像（ctl48 + NotifyCtx32 + SGE16 + pad32） */
-			uint8_t wqe[128];
-			memset(wqe, 0, sizeof(wqe));
-			uint32_t *wd = (uint32_t *)wqe;
-			uint64_t slot_off = inbox + (uint64_t)cid * 128u;
-			uint32_t owner = (((uint64_t)head & sqd) == 0u) ? 1u : 0u;	/* 官方 lap-parity（jetty.h:97 口径） */
-			wd[0] = ((head + 2) & 0xFFFFu) | (0x2Du << 16) | (1u << 28) | (1u << 29) | (owner << 31);
-			wd[1] = (5u << 8);				/* opcode=WRITE_WITH_NOTIFY=5（urma_types.hpp:77） */
-			wd[2] = sq.contextInfo.ubJfs.tpID | (1u << 24);
-			wd[3] = rtid & 0xFFFFFu;
-			memcpy(wqe + 16, sq.contextInfo.ubJfs.remoteEID, 16);
-			wd[8] = rtval;
-			wd[10] = (uint32_t)(slot_off & 0xFFFFFFFFull);
-			wd[11] = (uint32_t)(slot_off >> 32);
-			/* NotifyCtx（HcommUrmaNotifyCtx，inner_def.h:523-532；落点/收割语义标"语义待厂商"） */
-			wd[12] = rtid & 0xFFFFFu;			/* notifyTokenId */
-			wd[13] = rtval;					/* notifyTokenValue */
-			wd[14] = (uint32_t)(slot_off & 0xFFFFFFFFull);	/* notifyAddrL=槽控制头 */
-			wd[15] = (uint32_t)(slot_off >> 32);		/* notifyAddrH */
-			wd[16] = 1; wd[17] = 0;			/* notifyData=1（u64 写入 notifyAddr=valid 标志；39 实证 notify=数据写） */
-			/* SGE（dw20-23） */
-			wd[20] = 104;
-			wd[21] = ltid;
-			*(uint64_t *)(wqe + 88) = lva + 0x400;
-			/* 3) 双写上环：slot0（magic=0 无害）→ slot1（magic=head+2 真门铃） */
-			uint64_t slotVa0 = sq.contextInfo.ubJfs.sqVa + (uint64_t)(head % sqd) * 64u;
-			uint64_t slotVa1 = sq.contextInfo.ubJfs.sqVa + (uint64_t)((head + 1) % sqd) * 64u;
-			int frc = hp_fire(d_params, d_out, pstream, slotVa0,
-					  sq.contextInfo.ubJfs.dbVa, sq.contextInfo.ubJfs.headAddr, 0, wqe);
-			if (frc == 0)
-				frc = hp_fire(d_params, d_out, pstream, slotVa1,
-					      sq.contextInfo.ubJfs.dbVa, sq.contextInfo.ubJfs.headAddr, head + 2, wqe + 64);
-			printf("  wnfire：第 %d 发 cid=%u head=%u→%u rc=%d（slot0=0x%llx slot1=0x%llx）\n",
-			       it, cid, head, head + 2, frc,
-			       (unsigned long long)slotVa0, (unsigned long long)slotVa1);
-			/* 4) 收割发送侧 CQE（owner-bit，第 it 槽） */
-			uint64_t cq_slot = cq.contextInfo.ubJfc.scqVa + (uint64_t)((head0 + (uint32_t)it) % cqd) * 64u;
-			uint32_t exp_owner = ((((head0 + (uint32_t)it) / cqd) % 2u) == 0u) ? 1u : 0u;
-			int got = 0;
-			for (int w = 0; w < 5000; w++) {
-				uint8_t pb[4] = {0};
-				if (hp_read_data(d_params, d_out, pstream, cq_slot, 4, pb) == 0 &&
-				    (((*(uint32_t *)pb) >> 2) & 1u) == exp_owner) { got = 1; break; }
-				usleep(1000);
-			}
-			if (got) {
-				uint8_t cqeraw[32];
-				memset(cqeraw, 0, sizeof(cqeraw));
-				hp_read_data(d_params, d_out, pstream, cq_slot, 32, cqeraw);
-				struct n2_jfc_cqe *cqe = (struct n2_jfc_cqe *)cqeraw;
-				printf("  wnfire：CQE status=%u substatus=%u owner=%u\n",
-				       cqe->status, cqe->substatus, cqe->owner);
-				if (cqe->status == 0)
-					ok++;
-			} else {
-				printf("  wnfire：CQE 超时未见（如实记录）\n");
-			}
-			/* 4.5) 任务 40：AIV 图内回执收割——hp_read_data（AIV mode0 读 HBM）轮询
-			 * 回执槽 valid→命中后 4×64B AIV 分片读取比对→mode1 st_dev 写 0 清位复用。
-			 * 判据全部以 AIV 侧读数为准；host aclrtMemcpy 仅循环外降级观察帧。 */
-			int rcpt_ok = 0;
-			uint8_t vbuf[32];
-			for (int w = 0; w < 800; w++) {
-				memset(vbuf, 0, sizeof(vbuf));
-				if (hp_read_data(d_params, d_out, pstream, cqe_va, 32, vbuf) == 0 &&
-				    vbuf[16] == 1) { rcpt_ok = 1; break; }
-				usleep(10000);
-			}
-			if (rcpt_ok) {
-				uint32_t gotd[64];
-				int dm = 1;
-				for (int s = 0; s < 4; s++) {
-					if (hp_read_data(d_params, d_out, pstream, data_va + (uint64_t)s * 64u,
-							 64, (uint8_t *)gotd + (size_t)s * 64u) != 0) {
-						dm = -1; break;
-					}
-				}
-				if (dm == 1)
-					for (int i = 0; i < 64; i++)
-						if (gotd[i] != (uint32_t)i) { dm = 0; break; }
-				hp_harmless_db_write(d_params, d_out, pstream, cqe_va + 16);	/* 清 valid（byte16 所在 u32） */
-				printf("  wnfire：第 %d 发回执 AIV 收割 valid=1 cid=%u 数据=%s（已清位）\n",
-				       it, cid, dm == 1 ? "MATCH" : (dm == 0 ? "MISMATCH" : "AIV 读失败"));
-				if (dm == 1)
-					rok++;
-			} else {
-				printf("  wnfire：第 %d 发回执 valid 超时未见（AIV 轮询 8s，如实记录）\n", it);
-			}
+		uint64_t fidx0 = 0;
+		memset(&pp, 0, sizeof(pp));
+		pp.sqVa = sq.contextInfo.ubJfs.sqVa;
+		pp.dbVa = sq.contextInfo.ubJfs.dbVa;
+		pp.headAddr = sq.contextInfo.ubJfs.headAddr;
+		pp.scqVa = cq.contextInfo.ubJfc.scqVa;
+		pp.sqDepth = sq.contextInfo.ubJfs.sqDepth;
+		pp.cqDepth = cq.contextInfo.ubJfc.cqDepth;
+		if (hp_read_data(d_params, d_out, pstream, pp.headAddr, 4, u32buf) == 0)
+			pp.head0 = *(uint32_t *)u32buf;
+		pp.inbox = rmt + 0x800;
+		pp.rtid = rtid; pp.rtval = rtval; pp.ltid = ltid;
+		pp.tpID = sq.contextInfo.ubJfs.tpID;
+		memcpy(pp.rmtEID, sq.contextInfo.ubJfs.remoteEID, 16);
+		pp.staging_va = lva + 0x400;
+		pp.cqe_va = lva + 0x100;
+		pp.data_va = lva + 0x200;
+		pp.fire_idx_va = lva + 0x500;
+		pp.cmd.opc = 0x02;
+		pp.cmd.nsid = 1;
+		pp.cmd.cdw10 = 8;	/* slba = slba_base + idx × block_lbas = 0 + 1×8（静态用例） */
+		pp.route.ctrlid = 0x1001;
+		pp.route.sqid = 1;
+		pp.route.jetty_token = 0xACFEu;
+		pp.seg.address = pp.data_va;
+		pp.seg.length = 256;
+		pp.seg.token_id = ltid;
+		if (aclrtMemcpy((char *)dbuf + 0x500, 8, &fidx0, 8, ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS ||
+		    aclrtMemcpy((char *)dbuf + 0x600, sizeof(pp), &pp, sizeof(pp), ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+			printf("FAIL prep H2D\n"); return 2;
 		}
-		/* 5) 降级观察帧：host aclrtMemcpy D2H 对照读数（打印用，非判据） */
+		/* d_params 一次性（mode4 + prep 包地址），热路径复用 */
 		{
-			uint8_t vb[32];
-			uint32_t hd[4];
-			memset(vb, 0, sizeof(vb));
-			memset(hd, 0, sizeof(hd));
-			aclrtMemcpy(vb, sizeof(vb), (char *)dbuf + 0x100, sizeof(vb), ACL_MEMCPY_DEVICE_TO_HOST);
-			aclrtMemcpy(hd, sizeof(hd), (char *)dbuf + 0x200, sizeof(hd), ACL_MEMCPY_DEVICE_TO_HOST);
-			printf("  wnfire：host 降级观察帧 cqe[16]=%u data[0..3]=%u,%u,%u,%u（非判据，末发清位后应为 0）\n",
-			       vb[16], hd[0], hd[1], hd[2], hd[3]);
-			printf("  [%s] wnfire 回执面 AIV 图内闭环（%u/%d 发 CQE=0 + %u/%d 发回执 AIV 侧 MATCH）\n",
-			       (ok == (uint32_t)g_wniters && rok == (uint32_t)g_wniters) ? "PASS" : "FAIL",
-			       ok, g_wniters, rok, g_wniters);
+			struct hp_fire_params hp;
+			memset(&hp, 0, sizeof(hp));
+			hp.addr = lva + 0x600;
+			hp.mode = 4;
+			if (aclrtMemcpy(d_params, sizeof(hp), &hp, sizeof(hp), ACL_MEMCPY_HOST_TO_DEVICE) != 0) {
+				printf("FAIL d_params H2D\n"); return 2;
+			}
 		}
+		printf("  wnfire：prep 完成（prep@dbuf+0x600 fire_idx@dbuf+0x500 head0=%u sizeof(prep)=%zu）——此后热路径零 H2D\n",
+		       (uint32_t)pp.head0, sizeof(pp));
+
+		/* ---- 热路径（每发：aclnn 启动+sync+D2H 观察；零 H2D） ---- */
+		uint32_t ok = 0, rok = 0;
+		for (int it = 0; it < g_wniters; it++) {
+			uint64_t ws = 0;
+			aclOpExecutor *exec = NULL;
+			aclTensor *tp = hp_mk(d_params, 256);
+			aclTensor *to = hp_mk(d_out, 256);
+			struct hp_probe_out ho;
+			int rc = (int)aclnnAnoProbeGetWorkspaceSize(tp, to, &ws, &exec);
+			if (rc == 0)
+				rc = (int)aclnnAnoProbe(NULL, ws, exec, pstream);
+			if (rc == 0)
+				rc = (int)aclrtSynchronizeStream(pstream);
+			aclDestroyTensor(tp);
+			aclDestroyTensor(to);
+			memset(&ho, 0, sizeof(ho));
+			if (rc == 0)
+				rc = (int)aclrtMemcpy(&ho, sizeof(ho), d_out, sizeof(ho), ACL_MEMCPY_DEVICE_TO_HOST);
+			if (rc != 0) {
+				printf("  wnfire：第 %d 发 mode4 调用失败 rc=%d（如实记录）\n", it, rc);
+				continue;
+			}
+			printf("  wnfire：第 %d 发（mode4 全链）：fire_idx=%u cid=%u CQE ok=%u status=%u substatus=%u 回执 ok=%u 数据=%s\n",
+			       it, *(uint32_t *)(ho.data + 8), ho.data[5], ho.data[0], ho.data[1], ho.data[2],
+			       ho.data[3], ho.data[4] ? "MATCH" : "MISMATCH/未达");
+			if (ho.data[0] == 1 && ho.data[1] == 0)
+				ok++;
+			if (ho.data[3] == 1 && ho.data[4] == 1)
+				rok++;
+		}
+		printf("  [%s] wnfire 全链一体闭环（%u/%d 发 CQE=0 + %u/%d 发回执 AIV 侧 MATCH；热路径零 H2D 代码审查在案）\n",
+		       (ok == (uint32_t)g_wniters && rok == (uint32_t)g_wniters) ? "PASS" : "FAIL",
+		       ok, g_wniters, rok, g_wniters);
 		touch("/tmp/hcomm_fire_done_lijiawen");
 	}
 

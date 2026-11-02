@@ -1,5 +1,5 @@
 #!/bin/bash
-# 任务 42：ANO 改名版命令面对（AnoProbe 算子；编排同任务 39 wn_pair.sh，仅路径适配）
+# 任务 43：全链一体复验对（tgt_wn=ano_wn 封存件零改动 + wn_full mode4）
 C=/usr/local/Ascend/cann-9.3.0
 NB=/data/disk2/pyptouser/ssulijiawen/aiv_scratch/taskM42
 V=$NB/opp_priv_ano/vendors/customize
@@ -10,13 +10,13 @@ export ASCEND_CUSTOM_OPP_PATH=$V
 D=${TASK_DEVICE:-1}
 N=${1:-1}
 if [ "$D" != "1" ] && [ "$D" != "2" ]; then echo "[wn] 拒绝：device $D 不在白名单"; exit 64; fi
-HS=/data/disk2/pyptouser/ssulijiawen/aiv_scratch/taskM42/ano_wn
+HS=/data/disk2/pyptouser/ssulijiawen/aiv_scratch/taskM43/ano_full
 rm -f /tmp/hcomm_srv_* /tmp/hcomm_cli_* /tmp/hcomm_probe_stop_lijiawen /tmp/hcomm_fire_done_lijiawen /tmp/wn_tgt_done_lijiawen
 echo "[wn] device=$D iters=$N 启动 tgt_wn wnrecv"
-timeout 500 stdbuf -o0 $HS/tgt_wn wnrecv "$D" 0 "$D" "$N" > /tmp/wn_tgt_log_lijiawen.txt 2>&1 &
+timeout 500 stdbuf -o0 /data/disk2/pyptouser/ssulijiawen/aiv_scratch/taskM42/ano_wn/tgt_wn wnrecv "$D" 0 "$D" "$N" > /tmp/wn_tgt_log_lijiawen.txt 2>&1 &
 sleep 8
 echo "[wn] 单发/连发 wn_host wnfire ×$N"
-timeout 500 stdbuf -o0 $HS/wn_host wnfire "$D" 0 "$D" "$N"
+timeout 500 stdbuf -o0 $HS/wn_full wnfire "$D" 0 "$D" "$N"
 CLI_RC=$?
 for i in $(seq 1 240); do [ -f /tmp/wn_tgt_done_lijiawen ] && break; sleep 1; done
 sleep 2
