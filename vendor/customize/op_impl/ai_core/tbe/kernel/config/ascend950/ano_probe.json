@@ -1,0 +1,49 @@
+{
+  "binList": [
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "AnoProbe/d=0,p=1/4,2/4,2",
+        "AnoProbe/d=0,p=0/4,2/4,2",
+        "AnoProbe/d=1,p=1/4,2/4,2",
+        "AnoProbe/d=1,p=0/4,2/4,2"
+      ],
+      "staticKey": "7c4df8d0df0fa5bebd598dfabfafeeeb6156217173ba591cc445ccb8c52d20ab,69168e29abce8ddaffbdf0e7fa9d56376885055fa66985b62575592e4e344eba",
+      "inputs": [
+        {
+          "name": "params",
+          "index": 0,
+          "dtype": "uint8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "out",
+          "index": 0,
+          "dtype": "uint8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend950/ano_probe/AnoProbe_bbf60d681f1288d3a712929fcfbe5717.json"
+      }
+    }
+  ]
+}
